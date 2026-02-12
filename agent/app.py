@@ -203,6 +203,70 @@ You will receive:
 ---END-JSON---
 """
 
+def refine_plan_until_safe(log_text, payload, max_attempts=3):
+    job_name = payload.get("job_name")
+    attempt = 1
+
+    kb_structured = None
+    try:
+        kb = get_kb()
+        if kb:
+            kb_structured = kb.try_build_plan(log_text, {})
+    except Exception as e:
+        print(f"[CLI:KB] Error while loading/using KB: {e}")
+        kb_structured = None
+
+    # -------------------------------------------------------------------------
+    # If KB matched, use KB plan and skip LLM
+    # -------------------------------------------------------------------------
+    if kb_structured:
+        attempt = max_attempts  # skip regeneration loop since we're using KB plan
+        print("\n===== KB MATCH FOUND — USING KB FIX PLAN =====\n")
+        human = f"""
+**Root Cause**
+- {kb_structured.get("root_cause")}
+
+**What will be executed (if approved)**  
+{chr(10).join([f"- [{a['id']}] {a['capability']}" for a in kb_structured.get('actions', [])])}
+
+(This plan came from S3 Knowledge Base, not the LLM.)
+""".strip()
+
+        structured = kb_structured
+
+    else:
+        print("\n===== NO KB MATCH — RUNNING LLM =====\n")
+        raw = run_agent(log_text)
+        human, structured = parse_sections(raw)
+
+
+    while attempt <= max_attempts:
+        if not isinstance(structured, dict) or not structured.get("actions"):
+            sem_errors = ["Plan missing 'actions' array or failed to parse JSON."]
+            blast_errors = []
+        else:
+            sem_errors, _ = semantic_safety_check(structured)
+            blast_errors = blast_radius_check(structured, job_name)
+
+        print(f"\n[SFT PASS {attempt}/{max_attempts}] semantic errors={sem_errors}, blast errors={blast_errors}")
+
+        if not sem_errors and not blast_errors:
+            return human, structured, sem_errors, blast_errors, attempt, True
+
+        repair_prompt = build_repair_context(job_name, sem_errors, blast_errors)
+        raw = run_agent(log_text, repair_context=repair_prompt)
+        human, structured = parse_sections(raw)
+        attempt += 1
+
+    if not isinstance(structured, dict) or not structured.get("actions"):
+        sem_errors = ["Plan missing 'actions' array or failed to parse JSON."]
+        blast_errors = []
+    else:
+        sem_errors, _ = semantic_safety_check(structured)
+        blast_errors = blast_radius_check(structured, job_name)
+
+    return human, structured, sem_errors, blast_errors, attempt-1, False
+
 def agent_flow(log_text, payload=None):
     to_email = "pasumarthynivas5@gmail.com"
 
@@ -289,7 +353,10 @@ def agent_flow(log_text, payload=None):
     )
 
     if decision == "approve":
-        run_approval_agent()
+        # === Call execution Lambda with ONLY the actions array
+        result = invoke_execution_lambda(structured)
+        print("\n===== EXECUTION LAMBDA RESULT (agent_flow) =====")
+        print(json.dumps(result, indent=2))
     elif decision == "deny":
         print("\n❌ Denied — stopping workflow")
     else:
@@ -514,7 +581,7 @@ def parse_sections(raw: str):
     except Exception:
         pass
 
-    # 2) Unescape HTML entities (&lt; &gt; etc.)
+    # 2) Unescape HTML entities (< > etc.)
     raw_unescaped = html.unescape(text_for_parsing)
 
     # 3) Robust regex — match anything between markers
@@ -697,79 +764,71 @@ Issues you MUST correct:
 Regenerate the plan now, keeping all format requirements EXACTLY.
 """
 
+# -----------------------------
+# Lambda invocation helper
+# -----------------------------
+def invoke_execution_lambda(structured: dict) -> Dict:
+    """
+    Invoke the execution Lambda synchronously with ONLY the actions array as payload.
 
-def refine_plan_until_safe(log_text, payload, max_attempts=3):
-    job_name = payload.get("job_name")
-    attempt = 1
+    - FunctionName: Glue_Execution_Agent
+    - Payload: JSON array = structured["actions"]
 
-    kb_structured = None
+    Returns the parsed Lambda JSON response (or best-effort dict on parse error).
+    """
+    # 1) Extract only the actions array
+    actions = []
     try:
-        kb = get_kb()
-        if kb:
-            kb_structured = kb.try_build_plan(log_text, {})
+        if isinstance(structured, dict):
+            actions = structured.get("actions") or []
+        if not isinstance(actions, list):
+            print("⚠️ 'actions' is present but not a list. Coercing to empty list.")
+            actions = []
     except Exception as e:
-        print(f"[CLI:KB] Error while loading/using KB: {e}")
-        kb_structured = None
+        print(f"⚠️ Error extracting actions from structured plan: {e}")
+        actions = []
 
-    # -------------------------------------------------------------------------
-    # If KB matched, use KB plan and skip LLM
-    # -------------------------------------------------------------------------
-    if kb_structured:
-        attempt = max_attempts  # skip regeneration loop since we're using KB plan
-        print("\n===== KB MATCH FOUND — USING KB FIX PLAN =====\n")
-        human = f"""
-**Root Cause**
-- {kb_structured.get("root_cause")}
+    if not actions:
+        print("⚠️ No actions to send. Skipping Lambda invocation.")
+        return {"status": "skipped", "reason": "no_actions"}
 
-**What will be executed (if approved)**  
-{chr(10).join([f"- [{a['id']}] {a['capability']}" for a in kb_structured.get('actions', [])])}
+    # 2) Invoke Lambda
+    function_name = "Glue_Execution_Agent"  # <- your Lambda name
+    region =  "us-east-1"
+    account_b_id = "997525378140"  # <-- replace with real Account B ID
+    function_arn = f"arn:aws:lambda:us-east-1:{account_b_id}:function:Glue_Execution_Agent"
 
-(This plan came from S3 Knowledge Base, not the LLM.)
-""".strip()
-
-        structured = kb_structured
-
-    else:
-        print("\n===== NO KB MATCH — RUNNING LLM =====\n")
-        raw = run_agent(log_text)
-        human, structured = parse_sections(raw)
-
-
-    while attempt <= max_attempts:
-        if not isinstance(structured, dict) or not structured.get("actions"):
-            sem_errors = ["Plan missing 'actions' array or failed to parse JSON."]
-            blast_errors = []
-        else:
-            sem_errors, _ = semantic_safety_check(structured)
-            blast_errors = blast_radius_check(structured, job_name)
-
-        print(f"\n[SFT PASS {attempt}/{max_attempts}] semantic errors={sem_errors}, blast errors={blast_errors}")
-
-        if not sem_errors and not blast_errors:
-            return human, structured, sem_errors, blast_errors, attempt, True
-
-        repair_prompt = build_repair_context(job_name, sem_errors, blast_errors)
-        raw = run_agent(log_text, repair_context=repair_prompt)
-        human, structured = parse_sections(raw)
-        attempt += 1
-
-    if not isinstance(structured, dict) or not structured.get("actions"):
-        sem_errors = ["Plan missing 'actions' array or failed to parse JSON."]
-        blast_errors = []
-    else:
-        sem_errors, _ = semantic_safety_check(structured)
-        blast_errors = blast_radius_check(structured, job_name)
-
-    return human, structured, sem_errors, blast_errors, attempt-1, False
-
+    print(f"🚀 Invoking Lambda '{function_name}' in region '{region}' with ONLY the actions array...")
+    try:
+        client = boto3.client("lambda", region_name=region)
+        payload = {"actions": actions}
+        resp = client.invoke(
+            FunctionName=function_arn,
+            InvocationType="RequestResponse",
+            Payload=json.dumps(payload).encode("utf-8")
+        )
+        payload_stream = resp.get("Payload")
+        payload_text = payload_stream.read().decode("utf-8", errors="replace") if hasattr(payload_stream, "read") else ""
+        try:
+            result = json.loads(payload_text)
+        except Exception:
+            # Fallback if the Lambda double-encoded JSON or returned a string
+            try:
+                result = json.loads(json.loads(payload_text))
+            except Exception:
+                print("⚠️ Could not parse Lambda result JSON. Raw:", payload_text[:1000])
+                result = {"raw": payload_text}
+        return result
+    except Exception as e:
+        print(f"❌ Lambda invocation failed: {e}")
+        return {"status": "failed", "error": str(e)}
 
 # -----------------------------
-# Fixer Lambda invocation
+# Fixer Lambda invocation (kept)
 # -----------------------------
 def run_approval_agent():
     print("\n===== APPROVAL AGENT =====")
     print("Plan approved ✅")
-
 
 # -----------------------------
 # CLI / Main
@@ -884,7 +943,11 @@ def main():
     )
 
     if decision == "approve":
-        run_approval_agent()
+        print("\nDecision: Approved ✅. Invoking execution Lambda...")
+        # === Call execution Lambda with ONLY the actions array
+        result = invoke_execution_lambda(structured)
+        print("\n===== EXECUTION LAMBDA RESULT (CLI) =====")
+        print(json.dumps(result, indent=2))
     elif decision == "deny":
         print("\nDecision: Denied ❌. Skipping follow-up agent.")
     else:
