@@ -1,0 +1,9 @@
+glue_error_index:
+  AccessDeniedException: errors/iam_failure.yaml
+  IAMFailure: errors/iam_failure.yaml
+  EntityNotFoundException: errors/entity_not_found.yaml
+  InvalidInputException: errors/invalid_input.yaml
+  S3NoSuchKey: errors/s3_no_such_key.yaml
+  GlueEncryptionException: errors/glue_encryption_exception.yaml
+  NetworkConnectionFailure: errors/network_connection_failure.yaml
+  ResourceLimitExceeded: errors/resource_limits.yaml

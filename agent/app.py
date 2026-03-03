@@ -116,6 +116,52 @@ try:
 except ImportError:
     raise SystemExit("Strands not installed. Run: pip install -r agent/requirements.txt")
 
+def fetch_glue_account_region(job_name: str) -> Dict[str, Optional[str]]:
+    """
+    Returns {'region': <region or None>, 'account_id': <acct or None>, 'job_arn': <arn or None>}
+    by calling glue.get_job and parsing its JobArn.
+    """
+    out = {"region": None, "account_id": None, "job_arn": None}
+    if not job_name:
+        return out
+
+    try:
+        glue = boto3.client("glue")  # region from env/profile; fine because ARN has region
+        resp = glue.get_job(JobName=job_name)
+        job = (resp or {}).get("Job") or {}
+        arn = job.get("JobArn")
+        out["job_arn"] = arn
+        if isinstance(arn, str) and arn.startswith("arn:aws:glue:"):
+            # arn:aws:glue:<region>:<account>:job/<name>
+            parts = arn.split(":")
+            if len(parts) >= 6:
+                out["region"] = parts[3]
+                out["account_id"] = parts[4]
+        return out
+    except Exception as e:
+        print(f"⚠️ fetch_glue_account_region failed for JobName={job_name}: {e}")
+        return out
+
+
+def enrich_with_glue_region_account(structured: dict, job_name: Optional[str]) -> dict:
+    """
+    Populates structured['__glue_region'] and structured['__glue_account_id'] using Glue.get_job.
+    No-op if job_name is falsy.
+    """
+    if not isinstance(structured, dict):
+        structured = {}
+    if not job_name:
+        return structured
+
+    info = fetch_glue_account_region(job_name)
+    region = info.get("region")
+    account = info.get("account_id")
+
+    if region:
+        structured["__glue_region"] = region
+    if account:
+        structured["__glue_account_id"] = account
+    return structured
 
 SYSTEM_PROMPT = """
 You are **Glue Doctor**, an expert at diagnosing AWS Glue job failures and producing an executable fix plan.
@@ -233,11 +279,13 @@ def refine_plan_until_safe(log_text, payload, max_attempts=3):
 """.strip()
 
         structured = kb_structured
+        structured = postprocess_plan(structured, job_name_hint=job_name, raw_log_text=log_text)
 
     else:
         print("\n===== NO KB MATCH — RUNNING LLM =====\n")
         raw = run_agent(log_text)
         human, structured = parse_sections(raw)
+        structured = postprocess_plan(structured, job_name_hint=job_name, raw_log_text=log_text)
 
 
     while attempt <= max_attempts:
@@ -256,6 +304,7 @@ def refine_plan_until_safe(log_text, payload, max_attempts=3):
         repair_prompt = build_repair_context(job_name, sem_errors, blast_errors)
         raw = run_agent(log_text, repair_context=repair_prompt)
         human, structured = parse_sections(raw)
+        structured = postprocess_plan(structured, job_name_hint=job_name, raw_log_text=log_text)
         attempt += 1
 
     if not isinstance(structured, dict) or not structured.get("actions"):
@@ -269,6 +318,16 @@ def refine_plan_until_safe(log_text, payload, max_attempts=3):
 
 def agent_flow(log_text, payload=None):
     to_email = "pasumarthynivas5@gmail.com"
+    job_name = payload.get("job_name") if payload else None
+
+    # ⭐ FIX: If job_name is missing, extract from log or actions
+    if not job_name:
+        # try fallback from LLM plan (JobName always exists after postprocess)
+        for a in payload.get("actions", []):
+            p = a.get("params") or {}
+            if "JobName" in p:
+                job_name = p["JobName"]
+                break
 
     # 1) Try safe regeneration loop
     human, structured, sem_errors, blast_errors, attempts, is_safe = refine_plan_until_safe(
@@ -277,8 +336,15 @@ def agent_flow(log_text, payload=None):
         max_attempts=3
     )
 
+    structured = postprocess_plan(structured, job_name_hint=job_name, raw_log_text=log_text)
+
+    if should_shape_minimal_flow(structured):
+        structured = shape_to_minimal_s3_write_flow(structured, job_name)
+
+    # 🔹 NEW: Ensure glue.get_job is the FIRST action (a0) with params.job_name set
+    structured = ensure_glue_get_job_first(structured, job_name)
+
     # 2) Compute safety score
-    job_name = payload.get("job_name") if payload else None
     score, penalty_components = safety_score(structured, job_name_from_payload=job_name)
 
     print("\n===== SAFETY SCORE =====")
@@ -291,6 +357,7 @@ def agent_flow(log_text, payload=None):
     print(json.dumps(structured, indent=2))
 
     # 2.b Build Lambda artifacts
+    # (structured already has a0: glue.get_job at index 0)
     lambda_steps = build_lambda_steps(structured)
     instructions = build_lambda_instructions(structured, job_name_from_payload=job_name)
 
@@ -353,15 +420,26 @@ def agent_flow(log_text, payload=None):
     )
 
     if decision == "approve":
-        # === Call execution Lambda with ONLY the actions array
-        result = invoke_execution_lambda(structured)
+        # ← Build envelope for API flow using payload job name
+        job_name = payload.get("job_name") if payload else None
+
+        structured = enrich_with_glue_region_account(structured, job_name)
+
+        # 🔹 NEW: Ensure glue.get_job is FIRST again before final envelope (defensive)
+        structured = ensure_glue_get_job_first(structured, job_name)
+
+        envelope = build_envelope(structured, job_name_from_payload=job_name)
+        print("\n===== ENVELOPE SENT TO LAMBDA =====")
+        print(json.dumps(envelope, indent=2))
+
+        result = invoke_execution_lambda_enveloped(envelope)
         print("\n===== EXECUTION LAMBDA RESULT (agent_flow) =====")
         print(json.dumps(result, indent=2))
+
     elif decision == "deny":
         print("\n❌ Denied — stopping workflow")
     else:
         print("\n⏱️ Timeout — no response")
-
 
 # -----------------------------
 # Email (SMTP) - sender side
@@ -616,6 +694,401 @@ def parse_sections(raw: str):
 
     return human_md.strip(), data
 
+# -----------------------------
+# Actions post-processing (normalize + dedupe + IAM canonicalize)
+# -----------------------------
+CANONICALIZE_S3_TRAILING_DOT = os.getenv("CANONICALIZE_S3_TRAILING_DOT", "1") == "1"
+CANONICALIZE_S3_TRAILING_SLASH = os.getenv("CANONICALIZE_S3_TRAILING_SLASH", "1") == "1"
+KEEP_ORIGINAL_S3_PATH = os.getenv("KEEP_ORIGINAL_S3_PATH", "1") == "1"
+
+AWS_ACCOUNT_RE = re.compile(r"arn:aws:[^:]+::(\d{12}):")
+AWS_REGION_RE = re.compile(r"\b([a-z]{2}-[a-z]+-\d)\b")
+ROLE_RE = re.compile(r"arn:aws:iam::(\d{12}):role/([^\"\'\s]+)")
+
+def extract_aws_context(log_text: str) -> dict:
+    """
+    Extract account id, region, role name from raw logs if present.
+    """
+    acct = None
+    region = None
+    role_name = None
+
+    if log_text:
+        m = AWS_ACCOUNT_RE.search(log_text)
+        if m:
+            acct = m.group(1)
+
+        m = AWS_REGION_RE.search(log_text)
+        if m:
+            region = m.group(1)
+
+        m = ROLE_RE.search(log_text)
+        if m:
+            role_name = m.group(2)
+
+    return {
+        "account_id": acct,
+        "region": region,
+        "role_name": role_name
+    }
+
+def _parse_s3_uri(uri: str):
+    """
+    Returns (bucket, key) or (None, None) if not s3 uri.
+    Accepts s3://bucket[/key]
+    """
+    if not uri or not isinstance(uri, str) or not uri.lower().startswith("s3://"):
+        return None, None
+    rest = uri[5:]
+    parts = rest.split("/", 1)
+    bucket = parts[0].strip().lower()
+    key = parts[1].strip() if len(parts) > 1 else ""
+    return (bucket or None), (key or None)
+
+def _canonicalize_s3_key(key: Optional[str]) -> Optional[str]:
+    if key is None:
+        return None
+    k = key.strip()
+    if CANONICALIZE_S3_TRAILING_SLASH and len(k) > 1 and k.endswith("/"):
+        k = k.rstrip("/")
+    if CANONICALIZE_S3_TRAILING_DOT and k.endswith("."):
+        k = k.rstrip(".")
+    # collapse accidental double slashes
+    while "//" in k:
+        k = k.replace("//", "/")
+    return k
+
+INJECT_JOBNAME_IN_GLUE_PARAMS = os.getenv("INJECT_JOBNAME_IN_GLUE_PARAMS", "0") == "1"
+
+def normalize_action_params_for_executor(action: dict, job_name_hint: Optional[str]) -> dict:
+    a = dict(action or {})
+    cap = (a.get("capability") or "").strip()
+    params = dict(a.get("params") or {})
+
+    if cap.startswith("glue.") and INJECT_JOBNAME_IN_GLUE_PARAMS:
+        if "JobName" not in params and "job_name" in params:
+            params["JobName"] = params.pop("job_name")
+        if "JobName" not in params and job_name_hint and cap in ("glue.start_job_run", "glue.get_job", "glue.get_job_run"):
+            params["JobName"] = job_name_hint
+
+    if cap == "s3.test_path_exists":
+        path = params.get("path")
+
+        # 1) If the incoming path ends with a trailing dot, rewrite to /* (wildcard prefix)
+        if isinstance(path, str) and path.lower().startswith("s3://") and path.endswith("."):
+            path = path[:-1] + "/*"
+            params["path"] = path  # update for subsequent parsing
+
+        # 2) Parse bucket/key from the (possibly rewritten) path
+        bucket, key = _parse_s3_uri(path) if path else (params.get("bucket"), params.get("key"))
+
+        # 3) SPECIAL RULE (archive): collapse ANY path under /archive/... to archive/*
+        #    Example: s3://bucket/archive/Manufacturing_dataset/*  -> s3://bucket/archive/*
+        if isinstance(path, str) and path.lower().startswith("s3://") and "/" in path[5:]:
+            # path[5:] -> "<bucket>/<rest>"
+            bucket_part, rest = path[5:].split("/", 1)
+            if rest.startswith("archive") and (rest == "archive" or rest.startswith("archive/")):
+                params["path"] = f"s3://{bucket_part}/archive/*"
+                params["bucket"] = bucket_part
+                params["key"] = "archive/*"
+                a["params"] = params
+                return a  # ✅ done — do not further alter 'path'
+
+        # 4) NEW RULE (file-like paths): if key looks like a file (has extension), collapse to parent prefix "parent/*"
+        #    Example: s3://bucket/raw/Manufacturing_dataset.csv[/*] -> s3://bucket/raw/*
+        def _looks_like_file(k: Optional[str]) -> bool:
+            if not k:
+                return False
+            # Take the last path component and see if it contains a dot not at start/end
+            file_part = k.rsplit("/", 1)[-1]
+            return ("." in file_part) and (not file_part.endswith("."))
+
+        if bucket:
+            # Remove a trailing "/*" or "/" when analyzing for file-likeness
+            normalized_key_for_detection = (key or "")
+            if normalized_key_for_detection.endswith("/*"):
+                normalized_key_for_detection = normalized_key_for_detection[:-2]
+            if normalized_key_for_detection.endswith("/"):
+                normalized_key_for_detection = normalized_key_for_detection[:-1]
+
+            if _looks_like_file(normalized_key_for_detection):
+                parent = normalized_key_for_detection.rsplit("/", 1)[0] if "/" in normalized_key_for_detection else ""
+                # Force to parent prefix
+                if parent:
+                    params["path"] = f"s3://{bucket}/{parent}/*"
+                    params["bucket"] = bucket
+                    params["key"] = f"{parent}/*"
+                else:
+                    # File at bucket root -> just use bucket root prefix
+                    params["path"] = f"s3://{bucket}/*"
+                    params["bucket"] = bucket
+                    params["key"] = "*"
+                a["params"] = params
+                return a  # ✅ done
+
+        # 5) Default canonicalization when not in archive and not file-like
+        if bucket:
+            key = _canonicalize_s3_key(key or "")
+            params["bucket"] = bucket
+            params["key"] = key
+
+            # Keep the path string consistent if you prefer; otherwise preserve original
+            if not KEEP_ORIGINAL_S3_PATH:
+                params["path"] = f"s3://{bucket}/{key}" if key else f"s3://{bucket}"
+
+    a["params"] = params
+    return a
+
+def canonicalize_iam_policy_resources(action: dict) -> dict:
+    """
+    For iam.propose_policy_patch:
+    - Collapse all S3 Resource ARNs to bucket-level only: arn:aws:s3:::bucket/*
+    - Deduplicate resources while preserving order
+    """
+    if (action.get("capability") or "").strip() != "iam.propose_policy_patch":
+        return action
+
+    params = action.get("params") or {}
+    policy = params.get("policy") or {}
+    statements = policy.get("Statement") or []
+
+    new_statements = []
+    for st in statements:
+        if not isinstance(st, dict):
+            new_statements.append(st)
+            continue
+
+        resources = st.get("Resource")
+        if not resources:
+            new_statements.append(st)
+            continue
+
+        res_list = resources if isinstance(resources, list) else [resources]
+        collapsed = []
+
+        for r in res_list:
+            if isinstance(r, str) and r.startswith("arn:aws:s3:::"):
+                try:
+                    bucket = r.split(":::")[1].split("/")[0]
+                    collapsed.append(f"arn:aws:s3:::{bucket}/*")
+                except Exception:
+                    collapsed.append(r)
+            else:
+                collapsed.append(r)
+
+        # De-dup
+        seen = set()
+        deduped = []
+        for rr in collapsed:
+            if rr not in seen:
+                seen.add(rr)
+                deduped.append(rr)
+
+        st["Resource"] = deduped
+        new_statements.append(st)
+
+    policy["Statement"] = new_statements
+    params["policy"] = policy
+    action["params"] = params
+    return action
+
+def action_fingerprint(action: dict) -> tuple:
+    """
+    Build a capability-specific fingerprint for dedupe.
+    """
+    cap = (action.get("capability") or "").strip()
+    p = action.get("params") or {}
+
+    if cap == "s3.test_path_exists":
+        bucket = (p.get("bucket") or "").strip().lower()
+        key = (p.get("key") or "").strip()
+        if bucket or key:
+            return (cap, bucket, key)
+        return (cap, (p.get("path") or "").strip())
+
+    if cap.startswith("glue."):
+        job = (p.get("JobName") or p.get("job_name") or "").strip()
+        return (cap, job)
+
+    try:
+        keyed = json.dumps(p, sort_keys=True)
+    except Exception:
+        keyed = str(p)
+    return (cap, keyed)
+
+def postprocess_plan(structured: dict, job_name_hint: Optional[str], raw_log_text: Optional[str] = None) -> dict:
+    """
+    Normalize params (glue JobName, s3 bucket/key), canonicalize IAM policy resources,
+    dedupe actions, and attach raw log for envelope context extraction.
+    """
+    if not isinstance(structured, dict):
+        structured = {}
+
+    structured = enrich_with_glue_region_account(structured, job_name_hint)
+
+    actions = structured.get("actions") or []
+    normalized: List[dict] = []
+    seen = set()
+
+    for a in actions:
+        na = normalize_action_params_for_executor(a, job_name_hint)
+        na = canonicalize_iam_policy_resources(na)
+
+        fp = action_fingerprint(na)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        normalized.append(na)
+
+    out = dict(structured)
+    out["actions"] = normalized
+
+    # Attach raw log for later context extraction in build_envelope()
+    if raw_log_text and "__raw_log__" not in out:
+        out["__raw_log__"] = raw_log_text
+
+    return out
+
+S3_BUCKET_ARN_RE = re.compile(r"arn:aws:s3:::(?P<bucket>[^/]+)")
+
+def ensure_glue_get_job_first(structured: dict, job_name: Optional[str]) -> dict:
+    """
+    Ensure the first action is 'glue.get_job' with params.job_name=<job_name>.
+    Uses id='a0'. If an existing glue.get_job is present, we move it to the front and
+    enforce params.job_name to be set (lowercase field to match executor expectation).
+    """
+    if not isinstance(structured, dict):
+        structured = {}
+    actions = list(structured.get("actions") or [])
+
+    # Normalize job_name source
+    jn = job_name
+    if not jn:
+        # try context.target or any glue action param fields
+        for a in actions:
+            p = a.get("params") or {}
+            jn = p.get("job_name") or p.get("JobName") or jn
+        if not jn:
+            jn = (structured.get("__glue_job_name") or None)
+    # Final fallback: try context.target
+    try:
+        if not jn and isinstance(structured.get("context"), dict):
+            tgt = structured["context"].get("target") or {}
+            jn = tgt.get("job_name") or jn
+    except Exception:
+        pass
+
+    # Build required get_job action
+    required = {
+        "id": "a0",
+        "capability": "glue.get_job",
+        "params": {"job_name": jn} if jn else {"job_name": "UNKNOWN"},
+        "requires_approval": False
+    }
+
+    # Find existing glue.get_job actions
+    idx_existing = None
+    for i, a in enumerate(actions):
+        if (a.get("capability") or "").strip() == "glue.get_job":
+            idx_existing = i
+            break
+
+    if idx_existing is None:
+        # Prepend new a0
+        actions = [required] + actions
+    else:
+        # Move existing to front and enforce params.job_name
+        existing = actions.pop(idx_existing)
+        p = dict(existing.get("params") or {})
+        # Normalize JobName/job_name → job_name
+        if "JobName" in p and "job_name" not in p:
+            p["job_name"] = p.pop("JobName")
+        if jn and p.get("job_name") != jn:
+            p["job_name"] = jn
+        existing["params"] = p
+        existing["id"] = "a0"  # ensure well-known id
+        existing["requires_approval"] = False
+        actions = [existing] + actions
+
+    structured = dict(structured)
+    structured["actions"] = actions
+    return structured
+
+def _infer_bucket_from_actions_or_policy(structured: dict) -> Optional[str]:
+    # 1) from s3.test_path_exists path
+    for a in structured.get("actions", []):
+        if (a.get("capability") or "").strip() == "s3.test_path_exists":
+            p = a.get("params") or {}
+            bucket = (p.get("bucket") or "").strip()
+            if bucket:
+                return bucket
+            # fallback: parse path if present
+            path = p.get("path")
+            if path and path.lower().startswith("s3://"):
+                rest = path[5:]
+                b = rest.split("/", 1)[0].strip()
+                if b:
+                    return b
+
+    # 2) from any existing IAM policy S3 Resource ARNs
+    for a in structured.get("actions", []):
+        if (a.get("capability") or "").strip() == "iam.propose_policy_patch":
+            policy = (a.get("params") or {}).get("policy") or {}
+            stmts = policy.get("Statement") or []
+            for st in stmts:
+                res = st.get("Resource")
+                res_list = res if isinstance(res, list) else [res]
+                for r in res_list:
+                    if isinstance(r, str):
+                        m = S3_BUCKET_ARN_RE.match(r)
+                        if m:
+                            return m.group("bucket")
+    return None
+
+
+def shape_to_minimal_s3_write_flow(structured: dict, job_name: Optional[str]) -> dict:
+    """
+    Enforce the 3-action flow (without per-action JobName params):
+      a1: glue.get_job
+      a2: iam.propose_policy_patch (S3 write)
+      a3: glue.start_job_run
+    Bucket inferred from plan/logs; else placeholder.
+    """
+    bucket = _infer_bucket_from_actions_or_policy(structured)
+    bucket_arn = f"arn:aws:s3:::{bucket}/*" if bucket else "arn:aws:s3:::REPLACE_BUCKET/*"
+
+    out = dict(structured)
+    out["actions"] = [
+        # No params → executor should use context.target.job_name
+        {"id": "a1", "capability": "glue.get_job", "params": {}},
+        {
+            "id": "a2",
+            "capability": "iam.propose_policy_patch",
+            "params": {
+                "policy": {
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        # 👇 match your requested Sid
+                        "Sid": "KB_ADD_S3_WRITE",
+                        "Effect": "Allow",
+                        "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
+                        "Resource": bucket_arn
+                    }]
+                }
+            }
+        },
+        {"id": "a3", "capability": "glue.start_job_run", "params": {}}
+    ]
+
+    # ✅ Re-normalize but avoid reinjecting JobName into glue.* params.
+    # Passing job_name_hint=None prevents normalize_action_params_for_executor from adding JobName.
+    return postprocess_plan(out, job_name_hint=None, raw_log_text=structured.get("__raw_log__"))
+
+def should_shape_minimal_flow(structured: dict) -> bool:
+    if os.getenv("FORCE_MINIMAL_S3_WRITE_FLOW", "0") == "1":
+        return True
+    rc = (structured.get("root_cause") or "").lower()
+    return ("accessdenied" in rc and "s3:putobject" in rc) or False
 
 # -----------------------------
 # Lambda payload builders
@@ -716,11 +1189,13 @@ def build_lambda_steps(structured: dict) -> List[Dict]:
             path = params.get("path")
             bucket, key = parse_s3_uri(path)
             if bucket:
+                # Always need ListBucket to check prefixes
                 lambda_steps.append({
                     "Action": "s3:ListBucket",
                     "Resource": f"arn:aws:s3:::{bucket}"
                 })
-                if key:
+                # Only add HeadObject for exact object keys (no wildcard, no trailing slash)
+                if key and ("*" not in key) and (not key.endswith("/")):
                     lambda_steps.append({
                         "Action": "s3:HeadObject",
                         "Resource": f"arn:aws:s3:::{bucket}/{key}"
@@ -763,62 +1238,103 @@ Issues you MUST correct:
 
 Regenerate the plan now, keeping all format requirements EXACTLY.
 """
+def build_envelope(structured: dict, *, job_name_from_payload: Optional[str] = None) -> dict:
+    """
+    Build the execution envelope:
+    - MINIMAL_ENVELOPE=1 → omit account_id/region if unknown, omit execution_mode/controls/root_cause/confidence.
+    """
+    if not isinstance(structured, dict):
+        structured = {}
+    structured = enrich_with_glue_region_account(structured, job_name_from_payload)
+
+    META_SOURCE = os.getenv("META_SOURCE", "kb-self-healing-llm")
+    INCLUDE_EXECUTION_ID_IN_META = os.getenv("INCLUDE_EXECUTION_ID_IN_META", "0") == "1"
+    MINIMAL_ENVELOPE = os.getenv("MINIMAL_ENVELOPE", "0") == "1"
+
+    # Derive job_name
+    job_name = job_name_from_payload or None
+    if not job_name:
+        for a in structured.get("actions", []):
+            p = a.get("params") or {}
+            job_name = p.get("JobName") or p.get("job_name") or job_name
+    job_name = job_name or "UNKNOWN"
+
+    # Prefer Glue-derived hints (set by enrich_with_glue_region_account)
+    glue_region = structured.get("__glue_region")
+    glue_account = structured.get("__glue_account_id")
+
+    # meta
+    meta = {"source": META_SOURCE}
+    if INCLUDE_EXECUTION_ID_IN_META:
+        meta["execution_id"] = uuid.uuid4().hex[:12]
+
+    # target — only set account_id/region if we truly know them
+    target = {"type": "glue_job", "job_name": job_name}
+    if glue_account:  # only include if not None/empty
+        target["account_id"] = glue_account
+    if glue_region:
+        target["region"] = glue_region
+    # do NOT include execution_mode if minimal
+    context = {"target": target}
+
+    # default controls (non-minimal only)
+    defaults_controls = {
+        "requires_approval": any(a.get("requires_approval") for a in structured.get("actions", [])),
+        "prechecks": [],
+        "postchecks": [],
+        "rollback": None
+    }
+    controls = structured.get("controls") or defaults_controls
+
+    envelope = {
+        "meta": meta,
+        "context": context,
+        "actions": structured.get("actions") or []
+    }
+
+    if not MINIMAL_ENVELOPE:
+        envelope["controls"] = controls
+        # include these only in non-minimal mode
+        root_cause = structured.get("root_cause")
+        confidence = structured.get("confidence")
+        if root_cause is not None:
+            envelope["root_cause"] = root_cause.strip() if isinstance(root_cause, str) else root_cause
+        if confidence is not None:
+            envelope["confidence"] = confidence
+
+    return envelope
 
 # -----------------------------
 # Lambda invocation helper
 # -----------------------------
-def invoke_execution_lambda(structured: dict) -> Dict:
+def invoke_execution_lambda_enveloped(envelope: dict) -> Dict:
     """
-    Invoke the execution Lambda synchronously with ONLY the actions array as payload.
-
-    - FunctionName: Glue_Execution_Agent
-    - Payload: JSON array = structured["actions"]
-
-    Returns the parsed Lambda JSON response (or best-effort dict on parse error).
+    Invoke the execution Lambda synchronously with the FULL envelope.
+    FunctionName: Glue_Execution_Agent
     """
-    # 1) Extract only the actions array
-    actions = []
-    try:
-        if isinstance(structured, dict):
-            actions = structured.get("actions") or []
-        if not isinstance(actions, list):
-            print("⚠️ 'actions' is present but not a list. Coercing to empty list.")
-            actions = []
-    except Exception as e:
-        print(f"⚠️ Error extracting actions from structured plan: {e}")
-        actions = []
+    function_name = "Glue_Execution_Agent"
+    region = "us-east-1"
+    account_b_id = "997525378140"  # TODO: externalize/configure
+    function_arn = f"arn:aws:lambda:{region}:{account_b_id}:function:{function_name}"
 
-    if not actions:
-        print("⚠️ No actions to send. Skipping Lambda invocation.")
-        return {"status": "skipped", "reason": "no_actions"}
-
-    # 2) Invoke Lambda
-    function_name = "Glue_Execution_Agent"  # <- your Lambda name
-    region =  "us-east-1"
-    account_b_id = "997525378140"  # <-- replace with real Account B ID
-    function_arn = f"arn:aws:lambda:us-east-1:{account_b_id}:function:Glue_Execution_Agent"
-
-    print(f"🚀 Invoking Lambda '{function_name}' in region '{region}' with ONLY the actions array...")
+    print(f"🚀 Invoking Lambda '{function_name}' in region '{region}' with FULL envelope...")
     try:
         client = boto3.client("lambda", region_name=region)
-        payload = {"actions": actions}
         resp = client.invoke(
             FunctionName=function_arn,
             InvocationType="RequestResponse",
-            Payload=json.dumps(payload).encode("utf-8")
+            Payload=json.dumps(envelope).encode("utf-8")
         )
         payload_stream = resp.get("Payload")
         payload_text = payload_stream.read().decode("utf-8", errors="replace") if hasattr(payload_stream, "read") else ""
         try:
-            result = json.loads(payload_text)
+            return json.loads(payload_text)
         except Exception:
-            # Fallback if the Lambda double-encoded JSON or returned a string
             try:
-                result = json.loads(json.loads(payload_text))
+                return json.loads(json.loads(payload_text))
             except Exception:
                 print("⚠️ Could not parse Lambda result JSON. Raw:", payload_text[:1000])
-                result = {"raw": payload_text}
-        return result
+                return {"raw": payload_text}
     except Exception as e:
         print(f"❌ Lambda invocation failed: {e}")
         return {"status": "failed", "error": str(e)}
@@ -943,10 +1459,11 @@ def main():
     )
 
     if decision == "approve":
-        print("\nDecision: Approved ✅. Invoking execution Lambda...")
-        # === Call execution Lambda with ONLY the actions array
-        result = invoke_execution_lambda(structured)
-        print("\n===== EXECUTION LAMBDA RESULT (CLI) =====")
+        job_name = payload.get("job_name") if payload else None
+        envelope = build_envelope(structured, job_name_from_payload=job_name)
+        print("\n===== ENVELOPE SENT TO LAMBDA =====")
+        print(json.dumps(envelope, indent=2))
+        result = invoke_execution_lambda_enveloped(envelope)
         print(json.dumps(result, indent=2))
     elif decision == "deny":
         print("\nDecision: Denied ❌. Skipping follow-up agent.")
