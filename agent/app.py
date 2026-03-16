@@ -1291,6 +1291,29 @@ def build_envelope(structured: dict, *, job_name_from_payload: Optional[str] = N
         "context": context,
         "actions": structured.get("actions") or []
     }
+    # -----------------------------------------------
+    # ALWAYS APPEND FINAL glue.start_job_run ACTION
+    # -----------------------------------------------
+    job_name_final = job_name or "UNKNOWN"
+
+    final_action = {
+        "id": "a_final_start",
+        "capability": "glue.start_job_run",
+        "params": {
+            "JobName": job_name_final
+        },
+        "requires_approval": False
+    }
+
+    # append only if no duplicate start_job_run exists
+    existing_caps = [a.get("capability") for a in envelope["actions"]]
+    if "glue.start_job_run" not in existing_caps:
+        envelope["actions"].append(final_action)
+    else:
+        # if there *is* a glue.start_job_run, ensure ours is still last
+        envelope["actions"] = [
+            a for a in envelope["actions"] if a.get("capability") != "glue.start_job_run"
+        ] + [final_action]
 
     if not MINIMAL_ENVELOPE:
         envelope["controls"] = controls
